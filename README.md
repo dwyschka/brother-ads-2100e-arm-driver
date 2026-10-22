@@ -314,6 +314,10 @@ Layout:
 | `brother_ads/cli.py` | command line |
 | `packaging/` | udev rule, systemd unit, default config, `brother-ads-postscan` |
 
+## License
+
+Released under the [MIT License](LICENSE).
+
 ## Legal notes
 
 This is an independent, unofficial project and is not affiliated with Brother
