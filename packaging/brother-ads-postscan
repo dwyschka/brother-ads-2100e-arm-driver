@@ -1,0 +1,163 @@
+#!/usr/bin/python3
+"""Nachbearbeitung eines Scan-PDFs: leere Seiten entfernen, Seiten ausrichten.
+
+Aufruf als Hook in /etc/brother-ads.conf:
+    command = /usr/local/bin/brother-ads-postscan {file}
+
+- Leere Seiten (z. B. leere Rückseiten beim Duplex) werden gelöscht.
+- Die Ausrichtung jeder Seite wird per Tesseract-OSD erkannt und über das
+  PDF-Attribut /Rotate korrigiert (verlustfrei, das Bild bleibt unverändert).
+Die Datei wird atomar ersetzt; bei einem Fehler bleibt das Original liegen.
+"""
+
+import argparse
+import io
+from concurrent.futures import ThreadPoolExecutor
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+import pikepdf
+from PIL import Image, ImageFilter
+
+# Anteil "dunkler" Pixel, unterhalb dessen eine Seite als leer gilt.
+BLANK_RATIO = 0.0003
+# Pixel gelten als Tinte, wenn sie so viel dunkler als das Papier sind (0-255).
+INK_DELTA = 45
+# Rand, der bei der Leerseitenerkennung ignoriert wird (Schatten, Lochung).
+MARGIN = 0.05
+# Mindest-Konfidenz von Tesseract für eine Drehung.
+OSD_CONFIDENCE = 2.0
+# Längste Bildseite in Pixeln für die Ausrichtungserkennung. Tesseract-OSD
+# braucht ca. 300 dpi; bei 1000 px (A4 ~85 dpi) lag es oft daneben.
+OSD_SIDE = 2400
+BLANK_SIDE = 1000
+# Seiten pro Block und parallele Tesseract-Prozesse (begrenzt den Speicherbedarf).
+CHUNK = 8
+WORKERS = os.cpu_count() or 1
+
+
+def log(msg):
+    print("postscan: " + msg, flush=True)
+
+
+def page_image(page, max_side):
+    """Größte Bildebene der Seite als verkleinertes Graustufenbild."""
+    images = page.images
+    if not images:
+        return None
+    obj = max(images.values(), key=lambda o: int(o.Width) * int(o.Height))
+    img = None
+    if obj.get("/Filter") == "/DCTDecode":
+        img = Image.open(io.BytesIO(obj.read_raw_bytes()))
+        img.draft("L", (max_side, max_side))  # JPEG gleich verkleinert dekodieren
+    else:
+        img = pikepdf.PdfImage(obj).as_pil_image()
+    img = img.convert("L")
+    img.thumbnail((max_side, max_side))
+    return img
+
+
+def is_blank(img, ratio):
+    w, h = img.size
+    mx, my = int(w * MARGIN), int(h * MARGIN)
+    img = img.crop((mx, my, w - mx, h - my)).filter(ImageFilter.MedianFilter(3))
+    hist = img.histogram()
+    total = sum(hist)
+    paper = next(i for i in range(256) if sum(hist[: i + 1]) >= total / 2)
+    ink = sum(hist[: max(0, paper - INK_DELTA)])
+    return ink / total < ratio, ink / total
+
+
+def detect_rotation(img):
+    """Drehung im Uhrzeigersinn (0/90/180/270) oder None, wenn unsicher."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "p.png")
+        img.save(path)
+        r = subprocess.run(
+            ["tesseract", path, "stdout", "--psm", "0", "-l", "osd"],
+            capture_output=True, text=True, timeout=120,
+            env=dict(os.environ, OMP_THREAD_LIMIT="1"),  # Parallelität machen wir selbst
+        )
+    out = r.stdout
+    rot = re.search(r"Rotate:\s*(\d+)", out)
+    conf = re.search(r"Orientation confidence:\s*([\d.]+)", out)
+    if not rot or not conf:
+        return None
+    if float(conf.group(1)) < OSD_CONFIDENCE:
+        return None
+    return int(rot.group(1))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("file")
+    ap.add_argument("--no-blank", action="store_true", help="keine Leerseiten entfernen")
+    ap.add_argument("--no-rotate", action="store_true", help="Ausrichtung nicht korrigieren")
+    ap.add_argument("--blank-ratio", type=float, default=BLANK_RATIO)
+    ap.add_argument("--dry-run", action="store_true", help="nur anzeigen, Datei nicht ändern")
+    args = ap.parse_args()
+
+    path = args.file
+    if not path.lower().endswith(".pdf"):
+        log("%s ist kein PDF – übersprungen" % path)
+        return 0
+
+    pdf = pikepdf.open(path)
+    n = len(pdf.pages)
+    blank, rotated = [], 0
+    with ThreadPoolExecutor(WORKERS) as pool:
+        for start in range(0, n, CHUNK):
+            todo = []
+            for i in range(start, min(n, start + CHUNK)):
+                page = pdf.pages[i]
+                img = page_image(page, OSD_SIDE)
+                if img is None:
+                    continue
+                if not args.no_blank:
+                    small = img.copy()
+                    small.thumbnail((BLANK_SIDE, BLANK_SIDE))
+                    empty, share = is_blank(small, args.blank_ratio)
+                    log("Seite %d: Tinte %.4f%%%s" % (i + 1, share * 100, " -> leer" if empty else ""))
+                    if empty:
+                        blank.append(i)
+                        continue
+                if not args.no_rotate:
+                    # so wie ein Betrachter die Seite zeigt (bereits gesetztes /Rotate)
+                    todo.append((i, img.rotate(-int(page.get("/Rotate", 0)), expand=True)))
+            for (i, _), rot in zip(todo, pool.map(detect_rotation, [im for _, im in todo])):
+                if rot:
+                    log("Seite %d: um %d° gedreht" % (i + 1, rot))
+                    pdf.pages[i].rotate(rot, relative=True)
+                    rotated += 1
+
+    if len(blank) == n:
+        log("alle Seiten leer – Datei bleibt unverändert")
+        return 0
+    for i in reversed(blank):
+        del pdf.pages[i]
+
+    log("%s: %d Seite(n), %d leer entfernt, %d gedreht" % (os.path.basename(path), n, len(blank), rotated))
+    if args.dry_run or not (blank or rotated):
+        return 0
+    d, name = os.path.split(os.path.abspath(path))
+    tmp = os.path.join(d, ".%s.tmp" % name)
+    try:
+        pdf.save(tmp)
+        shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        log("Fehler: %s" % e)
+        sys.exit(1)

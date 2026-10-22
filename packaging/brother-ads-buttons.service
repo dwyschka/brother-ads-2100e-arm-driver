@@ -1,0 +1,16 @@
+[Unit]
+Description=Brother ADS scan-key daemon
+# Runs only while the scanner is attached (udev symlink /dev/brother_ads).
+BindsTo=dev-brother_ads.device
+After=dev-brother_ads.device local-fs.target
+
+[Service]
+Type=simple
+User=scanner
+Group=scanner
+ExecStart=/usr/local/bin/brother-ads buttons --config /etc/brother-ads.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=dev-brother_ads.device

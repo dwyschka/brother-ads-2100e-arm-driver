@@ -1,0 +1,7 @@
+# Brother ADS document scanners:
+#  - give the "scanner" group access to the USB device
+#  - /dev/brother_ads symlink -> systemd device unit dev-brother_ads.device,
+#    which starts/stops brother-ads-buttons.service on plug/unplug
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="04f9", \
+  ATTR{idProduct}=="037[cdef]|60a[0145]", MODE="0660", GROUP="scanner", \
+  ENV{libsane_matched}="yes", SYMLINK+="brother_ads", TAG+="systemd"

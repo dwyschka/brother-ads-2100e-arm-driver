@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brother-ads"
+version = "0.1.0"
+description = "Userspace driver for the Brother ADS-2100e document scanner (ARM friendly)"
+requires-python = ">=3.9"
+dependencies = ["pyusb>=1.0", "Pillow>=8"]
+
+[project.optional-dependencies]
+pdf = ["img2pdf"]
+
+[project.scripts]
+brother-ads = "brother_ads.cli:main"
+
+[tool.setuptools]
+packages = ["brother_ads"]
